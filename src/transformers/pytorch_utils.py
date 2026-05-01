@@ -238,22 +238,80 @@ def id_tensor_storage(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
     return tensor.device, unique_id, storage_size(tensor)
 
 
+# Sentinel attribute used to stash the per-instance lru_cache wrapper of a
+# method decorated with ``compile_compatible_method_lru_cache``. The attribute
+# name is module-private and encodes the id of the function object so that
+# distinct methods on the same instance do not collide.
+_PER_INSTANCE_CACHE_ATTR_PREFIX = "__transformers_method_lru_cache__"
+
+
 @wraps(lru_cache)
 def compile_compatible_method_lru_cache(*lru_args, **lru_kwargs):
     """
-    LRU cache decorator from standard functools library, but with a workaround to disable
-    caching when torchdynamo is compiling. Expected to work with class methods.
+    LRU cache decorator from the standard ``functools`` library, with two
+    transformers-specific tweaks:
+
+    1. Caching is disabled when ``torchdynamo`` is compiling, so the cache
+       never interferes with graph capture.
+    2. When the decorated callable is used as a **method on an**
+       :class:`torch.nn.Module` instance (i.e. its first positional argument
+       is an ``nn.Module``), the ``lru_cache`` is created lazily *per
+       instance* and stored on the instance itself. This prevents the
+       class-level cache from holding a strong reference to every instance
+       (and every tensor it returned) forever, which used to cause memory
+       leaks on models that decorated forward methods — see
+       https://github.com/huggingface/transformers/issues/45412.
+
+       When the decorated callable is a plain module-level function (e.g.
+       ``get_patches_center_coordinates`` in ``dinov3_vit``) there is no
+       ``self`` to leak through, and behaviour is identical to the original
+       ``lru_cache``-on-the-class-body implementation.
     """
 
     def decorator(func):
+        # Class-level cache used as a fallback for module-level functions and
+        # for any callsite where the first positional argument is not an
+        # ``nn.Module`` instance. Keeping this path unchanged preserves the
+        # original behaviour for every non-method callsite in the code base.
         func_with_cache = lru_cache(*lru_args, **lru_kwargs)(func)
+
+        # Each decorated function gets its own attribute name so that a class
+        # with several cached methods stores several independent per-instance
+        # caches without collisions.
+        cache_attr = f"{_PER_INSTANCE_CACHE_ATTR_PREFIX}{id(func)}"
 
         @wraps(func)
         def wrapper(*args, **kwargs):
             if is_torchdynamo_compiling():
                 return func(*args, **kwargs)
-            else:
-                return func_with_cache(*args, **kwargs)
+
+            # Per-instance path: only when called as a bound method on an
+            # ``nn.Module``. This is the common case for transformers models
+            # and is what was leaking memory.
+            if args and isinstance(args[0], nn.Module):
+                instance = args[0]
+                rest = args[1:]
+                instance_cache = instance.__dict__.get(cache_attr)
+                if instance_cache is None:
+                    # Bind ``func`` with ``self`` captured by closure so that
+                    # the cache key only includes the remaining arguments.
+                    # The cache lives on the instance, so when the instance
+                    # is garbage-collected the cache (and any cached tensors)
+                    # are released with it — no strong reference escapes.
+                    def _bound(*inner_args, _self=instance, **inner_kwargs):
+                        return func(_self, *inner_args, **inner_kwargs)
+
+                    instance_cache = lru_cache(*lru_args, **lru_kwargs)(_bound)
+                    # Stored via ``__dict__`` to bypass any ``__setattr__``
+                    # side effects on ``nn.Module`` (which intercepts
+                    # assignments of ``nn.Module`` / ``Parameter`` values).
+                    # Plain Python objects go straight into ``__dict__``.
+                    instance.__dict__[cache_attr] = instance_cache
+                return instance_cache(*rest, **kwargs)
+
+            # Fallback: original class-level cache for module-level functions
+            # and any other non-method usage.
+            return func_with_cache(*args, **kwargs)
 
         return wrapper
 
