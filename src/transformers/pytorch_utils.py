@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import inspect
+import weakref
 from collections.abc import Callable
 from functools import lru_cache, wraps
 
@@ -238,13 +239,6 @@ def id_tensor_storage(tensor: torch.Tensor) -> tuple[torch.device, int, int]:
     return tensor.device, unique_id, storage_size(tensor)
 
 
-# Sentinel attribute used to stash the per-instance lru_cache wrapper of a
-# method decorated with ``compile_compatible_method_lru_cache``. The attribute
-# name is module-private and encodes the id of the function object so that
-# distinct methods on the same instance do not collide.
-_PER_INSTANCE_CACHE_ATTR_PREFIX = "__transformers_method_lru_cache__"
-
-
 @wraps(lru_cache)
 def compile_compatible_method_lru_cache(*lru_args, **lru_kwargs):
     """
@@ -256,16 +250,38 @@ def compile_compatible_method_lru_cache(*lru_args, **lru_kwargs):
     2. When the decorated callable is used as a **method on an**
        :class:`torch.nn.Module` instance (i.e. its first positional argument
        is an ``nn.Module``), the ``lru_cache`` is created lazily *per
-       instance* and stored on the instance itself. This prevents the
-       class-level cache from holding a strong reference to every instance
-       (and every tensor it returned) forever, which used to cause memory
-       leaks on models that decorated forward methods — see
+       instance* and held in a module-private
+       :class:`weakref.WeakKeyDictionary`. This prevents the class-level
+       cache from holding a strong reference to every instance (and every
+       tensor it returned) forever, which used to cause memory leaks on
+       models that decorated forward methods — see
        https://github.com/huggingface/transformers/issues/45412.
 
        When the decorated callable is a plain module-level function (e.g.
        ``get_patches_center_coordinates`` in ``dinov3_vit``) there is no
        ``self`` to leak through, and behaviour is identical to the original
        ``lru_cache``-on-the-class-body implementation.
+
+    Design notes:
+
+    * The per-instance cache is stored in an *external*
+      ``WeakKeyDictionary`` rather than on ``instance.__dict__``. Stashing
+      an unpicklable closure directly on the module instance would break
+      ``pickle.dumps(model)`` / ``torch.save(model)`` — both are exercised
+      by ``torch.save``, multiprocessing ``DataLoader`` workers with
+      ``spawn``/``forkserver``, FSDP, and accelerate. Keeping the cache
+      outside the instance keeps ``__dict__`` fully picklable.
+    * The closure captures ``self`` through a :func:`weakref.ref`, not a
+      direct binding, so the closure itself does not keep the instance
+      alive — only the weak-dict entry does, and that entry is dropped
+      when the instance is garbage-collected.
+    * The :func:`isinstance` guard on ``nn.Module`` is load-bearing: the
+      decorator is also applied to module-level functions (e.g.
+      ``dinov3_vit.get_patches_center_coordinates``,
+      ``eomt_dinov3`` helpers, ``efficientloftr`` helpers) whose first
+      argument is an ``int`` / ``torch.Tensor`` that cannot be
+      weak-referenced. Those callsites fall through to the original
+      class-level ``lru_cache`` path.
     """
 
     def decorator(func):
@@ -275,10 +291,10 @@ def compile_compatible_method_lru_cache(*lru_args, **lru_kwargs):
         # original behaviour for every non-method callsite in the code base.
         func_with_cache = lru_cache(*lru_args, **lru_kwargs)(func)
 
-        # Each decorated function gets its own attribute name so that a class
-        # with several cached methods stores several independent per-instance
-        # caches without collisions.
-        cache_attr = f"{_PER_INSTANCE_CACHE_ATTR_PREFIX}{id(func)}"
+        # Per-instance caches keyed weakly on the module instance. The cache
+        # and its captured tensors are released as soon as the instance is
+        # garbage-collected.
+        instance_caches: weakref.WeakKeyDictionary[nn.Module, Callable] = weakref.WeakKeyDictionary()
 
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -291,22 +307,27 @@ def compile_compatible_method_lru_cache(*lru_args, **lru_kwargs):
             if args and isinstance(args[0], nn.Module):
                 instance = args[0]
                 rest = args[1:]
-                instance_cache = instance.__dict__.get(cache_attr)
+                instance_cache = instance_caches.get(instance)
                 if instance_cache is None:
-                    # Bind ``func`` with ``self`` captured by closure so that
-                    # the cache key only includes the remaining arguments.
-                    # The cache lives on the instance, so when the instance
-                    # is garbage-collected the cache (and any cached tensors)
-                    # are released with it — no strong reference escapes.
-                    def _bound(*inner_args, _self=instance, **inner_kwargs):
-                        return func(_self, *inner_args, **inner_kwargs)
+                    # Capture ``self`` via a weak reference so the cached
+                    # closure does not extend the instance's lifetime.
+                    self_ref = weakref.ref(instance)
 
-                    instance_cache = lru_cache(*lru_args, **lru_kwargs)(_bound)
-                    # Stored via ``__dict__`` to bypass any ``__setattr__``
-                    # side effects on ``nn.Module`` (which intercepts
-                    # assignments of ``nn.Module`` / ``Parameter`` values).
-                    # Plain Python objects go straight into ``__dict__``.
-                    instance.__dict__[cache_attr] = instance_cache
+                    @lru_cache(*lru_args, **lru_kwargs)
+                    def _cached(*inner_args, **inner_kwargs):
+                        inst = self_ref()
+                        if inst is None:
+                            # Unreachable while the cache entry is alive in
+                            # ``instance_caches`` (which is itself keyed by
+                            # the instance). Guarded for safety.
+                            raise RuntimeError(
+                                f"Cached method {func.__qualname__} called after "
+                                "its owning instance was garbage-collected."
+                            )
+                        return func(inst, *inner_args, **inner_kwargs)
+
+                    instance_caches[instance] = _cached
+                    instance_cache = _cached
                 return instance_cache(*rest, **kwargs)
 
             # Fallback: original class-level cache for module-level functions
